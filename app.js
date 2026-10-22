@@ -8,7 +8,7 @@ const uid=()=>crypto.randomUUID();const fmt=s=>!Number.isFinite(s)?'0:00':`${Mat
 const size=n=>n<1048576?`${(n/1024).toFixed(0)} KB`:`${(n/1048576).toFixed(1)} MB`;
 function status(s){$('status').textContent=s}function node(tag,text,cls){let e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e}
 async function all(store){return request(tx(store).getAll())}
-async function put(store,item){return request(tx(store,'readwrite').put(item))}
+async function put(store,item){return new Promise((resolve,reject)=>{const transaction=db.transaction(store,'readwrite');transaction.oncomplete=()=>resolve();transaction.onerror=()=>reject(transaction.error||new Error('データベース書き込みエラー'));transaction.onabort=()=>reject(transaction.error||new Error('保存が中断されました'));transaction.objectStore(store).put(item)})}
 async function del(store,id){return request(tx(store,'readwrite').delete(id))}
 async function refresh(){let fs=await all('folders'),files=await all('files');tracks=files;let name=folder===null?'マイファイル':fs.find(f=>f.id===folder)?.name||'フォルダ';$('path').textContent='📂 '+name;$('back').disabled=folder===null;let root=$('list');root.replaceChildren();let visibleFolders=fs.filter(f=>f.parent===folder).sort((a,b)=>a.name.localeCompare(b.name,'ja'));let visibleFiles=files.filter(f=>f.parent===folder).sort((a,b)=>a.name.localeCompare(b.name,'ja'));for(let f of visibleFolders){let item=node('div',undefined,'item');item.append(node('span','📁','icon'));let name=node('div',undefined,'name');let open=node('button',f.name);open.onclick=()=>{folder=f.id;refresh()};name.append(open);item.append(name);let actions=node('div',undefined,'actions');let menu=node('button','⋯');menu.onclick=()=>menuFolder(f);actions.append(menu);item.append(actions);root.append(item)}for(let f of visibleFiles){let item=node('div',undefined,'item');item.append(node('span','🎵','icon'));let name=node('div',undefined,'name');let open=node('button',f.name);open.onclick=()=>start(f.id);name.append(open,node('div',size(f.size),'sub'));item.append(name);let actions=node('div',undefined,'actions');let menu=node('button','⋯');menu.onclick=()=>menuFile(f);actions.append(menu);item.append(actions);root.append(item)}if(!visibleFolders.length&&!visibleFiles.length)root.append(node('div','ここにはまだファイルがありません','empty'));$('usage').textContent=`保存曲数: ${files.length} 曲 / 合計: ${(files.reduce((s,f)=>s+f.size,0)/1073741824).toFixed(2)} GB`}
 function dialog(title,buttons){let d=$('dlg'),content=$('dialogcontent');content.replaceChildren(node('h3',title));for(let b of buttons){let btn=node('button',b.label);btn.onclick=async()=>{d.close();try{await b.action()}catch(e){status('操作できませんでした: '+e.message)}};content.append(btn)}d.showModal()}
@@ -16,7 +16,27 @@ $('cancel').onclick=()=>$('dlg').close();
 async function askName(message,initial=''){let name=prompt(message,initial);return name&&name.trim()?name.trim():null}
 $('newfolder').onclick=async()=>{let name=await askName('フォルダ名');if(name){await put('folders',{id:uid(),name,parent:folder});refresh()}};
 $('back').onclick=async()=>{let f=folder===null?null:await request(tx('folders').get(folder));folder=f?.parent??null;refresh()};
-$('pick').onchange=async e=>{let files=[...e.target.files];e.target.value='';if(!files.length)return;let count=0;for(let file of files){if(!file.type.startsWith('audio/')&&!supported.test(file.name)){status(`${file.name} は音声ファイルとして認識できません`);continue}try{status(`保存中 ${count+1}/${files.length}: ${file.name}`);await put('files',{id:uid(),name:file.name,parent:folder,size:file.size,blob:file,created:Date.now()});count++}catch(err){status(`保存失敗: ${err.message}。空き容量やSafariの保存領域を確認してください`);break}}await refresh();status(`${count} 件取り込みました。元ファイルは削除しないでください。`)};
+$('pick').onchange=async e=>{
+  const selected=[...e.target.files];e.target.value='';if(!selected.length)return;
+  let count=0;let failed=null;
+  for(const file of selected){
+    if(!file.type.startsWith('audio/')&&!supported.test(file.name)){failed=`${file.name}: 音声ファイルとして認識できません`;break}
+    try{
+      status(`保存中 ${count+1}/${selected.length}: ${file.name}`);
+      // iOS SafariではFileを直接保存するよりBlobに変換した方が安定する場合がある
+      const blob=new Blob([await file.arrayBuffer()],{type:file.type||'audio/mpeg'});
+      await put('files',{id:uid(),name:file.name,parent:folder,size:file.size,blob,created:Date.now()});
+      count++;
+    }catch(err){
+      const estimate=await navigator.storage?.estimate?.().catch(()=>null);
+      const extra=estimate?`（使用量 ${size(estimate.usage||0)} / 推定上限 ${size(estimate.quota||0)}）`:'';
+      failed=`${file.name}: ${err.name||'Error'} ${err.message||'保存できませんでした'} ${extra}`;
+      break;
+    }
+  }
+  try{await refresh()}catch(err){failed=failed||`一覧更新エラー: ${err.message}`}
+  status(failed?`取り込み失敗：${failed}。成功 ${count}/${selected.length} 曲。元ファイルは削除しないでください。`:`${count} 曲取り込みました。元ファイルは削除しないでください。`);
+};
 async function chooseFolder(item,store){let folders=await all('folders');let descendants=new Set([item.id]);if(store==='folders'){let changed=true;while(changed){changed=false;for(let f of folders)if(descendants.has(f.parent)&&!descendants.has(f.id)){descendants.add(f.id);changed=true}}}let options=[{id:null,name:'マイファイル'},...folders].filter(f=>store!=='folders'||!descendants.has(f.id));dialog('移動先を選択',options.map(f=>({label:f.name,action:async()=>{item.parent=f.id;await put(store,item);refresh()}})))}
 function menuFile(f){dialog(f.name,[{label:'名前変更',action:async()=>{let name=await askName('新しいファイル名',f.name);if(name){f.name=name;await put('files',f);refresh()}}},{label:'移動',action:()=>chooseFolder(f,'files')},{label:'ファイルに書き出す',action:async()=>{let a=document.createElement('a');let u=URL.createObjectURL(f.blob);a.href=u;a.download=f.name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),60000)}},{label:'削除',action:async()=>{if(confirm(`「${f.name}」を削除しますか？`)){if(current===f.id)stop();await del('files',f.id);refresh()}}}])}
 function menuFolder(f){dialog(f.name,[{label:'名前変更',action:async()=>{let name=await askName('新しいフォルダ名',f.name);if(name){f.name=name;await put('folders',f);refresh()}}},{label:'移動',action:()=>chooseFolder(f,'folders')},{label:'削除',action:async()=>{let fs=await all('folders'),files=await all('files');if(fs.some(x=>x.parent===f.id)||files.some(x=>x.parent===f.id)){alert('空のフォルダのみ削除できます');return}if(confirm(`「${f.name}」を削除しますか？`)){await del('folders',f.id);refresh()}}}])}
